@@ -1,79 +1,95 @@
-/**
- * Simple IndexedDB wrapper for persistent memory + image storage.
- * Falls back to in-memory if IndexedDB is unavailable.
- */
+import { supabase } from './supabase';
 
-const DB_NAME = 'dilanka_memories';
-const DB_VERSION = 1;
-const STORE = 'memories';
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const db = (e.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE, { keyPath: 'id' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-export async function getAllMemories(): Promise<Memory[]> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const req = tx.objectStore(STORE).getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-export async function saveMemory(memory: Memory): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put(memory);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function deleteMemory(id: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-export async function updateMemoryNote(id: string, note: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    const getReq = store.get(id);
-    getReq.onsuccess = () => {
-      const memory = getReq.result;
-      if (memory) {
-        memory.note = note;
-        store.put(memory);
-      }
-      tx.oncomplete = () => resolve();
-    };
-    getReq.onerror = () => reject(getReq.error);
-  });
-}
-
-// Type re-export so the db file is self-contained
-interface Memory {
+export interface Memory {
   id: string;
   image?: string;
   images?: string[];
   date: string;
   note: string;
+}
+
+// Upload base64 image to Supabase Storage and return public URL
+async function uploadBase64Image(base64: string): Promise<string> {
+  // If it's already a URL (e.g. from static memories or already uploaded), return it
+  if (base64.startsWith('http') || base64.startsWith('/')) return base64;
+
+  try {
+    const res = await fetch(base64);
+    const blob = await res.blob();
+    const ext = blob.type.split('/')[1] || 'jpg';
+    const fileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.${ext}`;
+    
+    const { error } = await supabase.storage.from('uploads').upload(fileName, blob);
+    if (error) throw error;
+    
+    const { data } = supabase.storage.from('uploads').getPublicUrl(fileName);
+    return data.publicUrl;
+  } catch (error) {
+    console.error("Error uploading image:", error);
+    throw error;
+  }
+}
+
+export async function getAllMemories(): Promise<Memory[]> {
+  const { data, error } = await supabase
+    .from('memories')
+    .select('*')
+    .order('date', { ascending: false });
+
+  if (error) {
+    console.error("Error fetching memories:", error);
+    return [];
+  }
+  return data || [];
+}
+
+export async function saveMemory(memory: Memory): Promise<void> {
+  let uploadedImages: string[] = [];
+  let uploadedImage: string | undefined = memory.image;
+  
+  if (memory.images && memory.images.length > 0) {
+    uploadedImages = await Promise.all(memory.images.map(uploadBase64Image));
+  }
+  if (memory.image) {
+    uploadedImage = await uploadBase64Image(memory.image);
+  }
+
+  const memoryToSave = {
+    ...memory,
+    images: uploadedImages,
+    image: uploadedImage,
+  };
+
+  const { error } = await supabase
+    .from('memories')
+    .upsert(memoryToSave);
+
+  if (error) {
+    console.error("Error saving memory:", error);
+    throw error;
+  }
+}
+
+export async function deleteMemory(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('memories')
+    .delete()
+    .eq('id', id);
+
+  if (error) {
+    console.error("Error deleting memory:", error);
+    throw error;
+  }
+}
+
+export async function updateMemoryNote(id: string, note: string): Promise<void> {
+  const { error } = await supabase
+    .from('memories')
+    .update({ note })
+    .eq('id', id);
+
+  if (error) {
+    console.error("Error updating note:", error);
+    throw error;
+  }
 }
